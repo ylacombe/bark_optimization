@@ -189,6 +189,8 @@ def timing_cuda(
     input_text: torch.LongTensor,
     voice_preset: str,
     device: torch.device = torch.device("cpu"),
+    assistant_model = None,
+    temperature = 0.7,
 ) -> Tuple[float, int]:
     """test generate_speech from BarkModel all at once, processing including
     """
@@ -202,16 +204,57 @@ def timing_cuda(
     start_event.record()
     
     inputs = processor(input_text, voice_preset).to(device)
-
-    for _ in tqdm(range(num_runs)):
-        _ = model.generate_speech(**inputs)
+    input_ids = inputs["input_ids"]
+    history_prompt = inputs.get("history_prompt", None)
+    
+    for i in tqdm(range(len(input_ids))):
+        for _ in range(num_runs):
+            _ = model.generate_speech(input_ids = input_ids[[i]], history_prompt=history_prompt, temperature=temperature)
 
 
     end_event.record()
     torch.cuda.synchronize()
     max_memory = torch.cuda.max_memory_allocated(device)
 
-    return (start_event.elapsed_time(end_event) * 1.0e-3) / num_runs, max_memory
+    return (start_event.elapsed_time(end_event) * 1.0e-3) / (num_runs * len(input_text)), max_memory
+
+
+def timing_cuda_assistant_model(
+    model: torch.nn.Module,
+    processor: "BarkProcessor",
+    num_runs: int,
+    input_text: torch.LongTensor,
+    voice_preset: str,
+    device: torch.device = torch.device("cpu"),
+    coarse_assistant = None,
+    temperature = 0.7,
+) -> Tuple[float, int]:
+    """test generate_speech from BarkModel all at once, processing including
+    """
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    torch.cuda.reset_peak_memory_stats(device)
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+    start_event.record()
+    
+    inputs = processor(input_text, voice_preset).to(device)
+    input_ids = inputs["input_ids"]
+    history_prompt = inputs.get("history_prompt", None)
+    
+    for i in tqdm(range(len(input_ids))):
+        for _ in range(num_runs):
+            _ = model.generate_speech(input_ids = input_ids[[i]], history_prompt=history_prompt, coarse_assistant=coarse_assistant,
+                                      temperature=temperature)
+
+
+    end_event.record()
+    torch.cuda.synchronize()
+    max_memory = torch.cuda.max_memory_allocated(device)
+
+    return (start_event.elapsed_time(end_event) * 1.0e-3) / (num_runs * len(input_text)), max_memory
 
 
 def timing_cuda_old(
