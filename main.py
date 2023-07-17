@@ -8,7 +8,7 @@ from transformers import (
     BarkProcessor,
 )
 
-from bark_modified import AssistedBarkModel, FlashAttentionBarkModel
+from bark_modified import FlashAttentionBarkModel
 
 from bark.api import generate_audio
 from bark.generation import preload_models, SAMPLE_RATE
@@ -24,7 +24,7 @@ set_seed(SEED)
 
 
 
-from utils import timing_cuda, timing_cuda_assistant_model
+from utils import timing_cuda
 
 
 def get_parser():
@@ -39,13 +39,13 @@ def get_parser():
         "--num_samples",
         type=int,
         default=50,
-        help="Number of samples to run. Larger number of samples might give a better estimate of the average time, but it will take longer to run.",
+        help="Number of samples to run. Larger number of samples might give a better estimate of the average time, but it will take longer to run. The real number of samples used will be batch_size*num_samples",
     )
     parser.add_argument(
         "--batch_size",
         type=int,
         default=1,
-        help="Input batch size. TODO: for now, only batch size = 1",
+        help="Input batch size.",
     )
 #    parser.add_argument(
 #        "--max-num-tokens",
@@ -66,9 +66,9 @@ def get_parser():
         help="The model compilation mode to use. Refer to the official tutorial of torch.compile: https://pytorch.org/tutorials//intermediate/torch_compile_tutorial.html for more details.",
     )
     parser.add_argument(
-        "--output-file",
+        "--output_file",
         type=str,
-        default="output.csv",
+        default="output_v2.csv",
         help="The output file to write results. If the file does not exist, it will be created. If the file exists, the results will be appended to the file.",
     )
     parser.add_argument(
@@ -80,7 +80,7 @@ def get_parser():
         "--precision",
         type=str,
         default="torch.float32",
-        help="Precision of torch dtype"
+        help="Precision of torch dtype (torch.float32, torch.float16, torch.int4, torch.int8)"
     )
     parser.add_argument(
         "--voice_preset",
@@ -93,7 +93,7 @@ def get_parser():
         "--optimization_type",
         type=str,
         default='no_optimization',
-        help="Optimization type to benchmark. For now, must be in ['flash_attention', 'no_optimization', 'generated_assistant']."
+        help="Optimization type to benchmark. For now, must be in ['flash_attention', 'no_optimization', 'generated_assistant', 'bettertransformer']."
     )
     
     parser.add_argument(
@@ -101,6 +101,20 @@ def get_parser():
         type=float,
         default=0.7,
         help="Temperature. Careful, set the temperature for every sub-models. So if you benchmark the degradation, be careful."
+    )
+    
+    parser.add_argument(
+        "--max_num_tokens",
+        type=int,
+        default=768,
+        help="`max_new_tokens` to generate. This argument is equivalent to the `max_new_tokens` argument in `model.generate`.",
+    )
+    
+    
+    parser.add_argument(
+        "--do_compile",
+        action="store_true",
+        help="Run compile benchmark. Compilation is not working really well atm",
     )
     
     return parser
@@ -115,162 +129,109 @@ if __name__ == "__main__":
     # dataset
     dataset = load_dataset("kensho/spgispeech", "dev", split="validation", use_auth_token=True)
     dataset = dataset.shuffle(seed=SEED)["transcript"]
-    dataset = dataset[:args.num_samples]
+    dataset = dataset[:(args.num_samples*args.batch_size)]
     
     optimization_type = args.optimization_type
+    
+    max_new_tokens = args.max_num_tokens
+    batch_size = args.batch_size
+    
+    additionnal_kwargs = {}
+    
+    if optimization_type in ["no_optimization", "generated_assistant", "bettertransformer"]:
+        model_class = BarkModel
 
-    if optimization_type == "no_optimization":
-        # model
-        model = BarkModel.from_pretrained(
-            args.model_path,
-            torch_dtype=eval(args.precision),
-            low_cpu_mem_usage= (args.precision=="torch.float16"),
-            )
     elif optimization_type == "flash_attention":
-        model = FlashAttentionBarkModel.from_pretrained(
-            args.model_path,
-            torch_dtype=eval(args.precision),
-            low_cpu_mem_usage= (args.precision=="torch.float16"),
-            )
-    elif optimization_type == "generated_assistant":
+        model_class = FlashAttentionBarkModel
+        
+    
+        
+
+    if args.precision in ["torch.int4", "torch.int8"]:
+        from transformers import BitsAndBytesConfig
+        quantization_config = {
+            "llm_int8_skip_modules":["encodec"],
+        }
+        
+        if args.precision == "torch.int4":
+            quantization_config["load_in_4bit"] = True
+        else:
+            quantization_config["load_in_8bit"] = True
+        
+        
+        quantization_config = BitsAndBytesConfig(**quantization_config)
+        
+        
+        model = model_class.from_pretrained(
+                args.model_path,
+                quantization_config=quantization_config)
+
+        
+    else:
+        model = model_class.from_pretrained(
+                args.model_path,
+                torch_dtype=eval(args.precision),
+                low_cpu_mem_usage= (args.precision=="torch.float16"),
+                )  
+        
+        if args.use_cpu:
+            model = model.to("cpu")
+        else:
+            model = model.to("cuda")
+
+    # processor
+    processor = BarkProcessor.from_pretrained(args.model_path)
+    
+    
+    if optimization_type == "generated_assistant":
         if "bark-large" not in args.model_path:
             raise ValueError("When using generated_assistant, you want to use 'bark_large' version.")
-        
-        model = AssistedBarkModel.from_pretrained(
-            args.model_path,
-            torch_dtype=eval(args.precision),
-            low_cpu_mem_usage= (args.precision=="torch.float16"),
-            )  
-        
+          
         model_small = BarkModel.from_pretrained("ylacombe/bark-small",
                                                 torch_dtype=eval(args.precision),
             low_cpu_mem_usage= (args.precision=="torch.float16"),)
-
-    # TODO: compilation
-    # processor
-    processor = BarkProcessor.from_pretrained(args.model_path)
-
-    if args.use_cpu:
-        model = model.to("cpu")
-    else:
-        model = model.to("cuda")
         
-    if optimization_type == "generated_assistant":
-        model_small = model_small.to(model.device)
+        additionnal_kwargs["coarse_assistant_model"] = model_small.coarse_acoustics.to(model.device)
         
         
-        # warmup
-        _ = timing_cuda_assistant_model(
-            model=model,
-            processor=processor,
-            num_runs=2,
-            input_text=dataset[:min(2, args.num_samples)],
-            voice_preset=args.voice_preset,
-            device = model.device,
-            coarse_assistant=model_small.coarse_acoustics,
-        )
+    if optimization_type == "bettertransformer":
         
-
-        # real timing
-        hf_time, hf_max_memory = timing_cuda_assistant_model(
-            model=model,
-            processor=processor,
-            num_runs=args.num_runs,
-            input_text=dataset,
-            voice_preset=args.voice_preset,
-            device = model.device,
-            coarse_assistant=model_small.coarse_acoustics,
-            temperature = args.temperature,
-        ) 
-        
-        print("Now compile")
-        
-        #model = torch.compile(model, mode=args.compile_mode, fullgraph=True, dynamic=True)
-        model.semantic = torch.compile(model.semantic, fullgraph=True, dynamic=True, mode = args.compile_mode) 
-        model.coarse_acoustics = torch.compile(model.coarse_acoustics, fullgraph=True, dynamic=True, mode = args.compile_mode) 
-        model.fine_acoustics = torch.compile(model.fine_acoustics, fullgraph=True, dynamic=True, mode = args.compile_mode)
-
-        #small_coarse = torch.compile(model_small.coarse_acoustics, mode=args.compile_mode, fullgraph=True, dynamic=True)
-        small_coarse = model_small.coarse_acoustics
-        
-        # warmup
-        _ = timing_cuda_assistant_model(
-            model=model,
-            processor=processor,
-            num_runs=2,
-            input_text=dataset[:min(2, args.num_samples)],
-            voice_preset=args.voice_preset,
-            device = model.device,
-            coarse_assistant=small_coarse,
-        )
-        
-
-        # real timing
-        sdpa_compile_time, compile_max_memory = timing_cuda_assistant_model(
-            model=model,
-            processor=processor,
-            num_runs=args.num_runs,
-            input_text=dataset,
-            voice_preset=args.voice_preset,
-            device = model.device,
-            coarse_assistant=small_coarse,
-            temperature = args.temperature,
-        ) 
+        from optimum.bettertransformer import BetterTransformer
 
 
-    else:
+        model = BetterTransformer.transform(model, keep_original_model=False)
 
 
-        # warmup
-        _ = timing_cuda(
-            model=model,
-            processor=processor,
-            num_runs=2,
-            input_text=dataset[:min(2, args.num_samples)],
-            voice_preset=args.voice_preset,
-            device = model.device,
-        )
-        
+    # warmup
+    _ = timing_cuda(
+        model=model,
+        processor=processor,
+        num_runs=2,
+        input_text=dataset[:min(2*batch_size, (args.num_samples*batch_size))],
+        voice_preset=args.voice_preset,
+        device = model.device,
+        max_new_tokens=max_new_tokens,
+        batch_size=batch_size,
+        **additionnal_kwargs,
+    )
+    
 
-        # real timing
-        hf_time, hf_max_memory = timing_cuda(
-            model=model,
-            processor=processor,
-            num_runs=args.num_runs,
-            input_text=dataset,
-            voice_preset=args.voice_preset,
-            device = model.device,
-            temperature = args.temperature,
-        ) 
+    # real timing
+    hf_time, hf_max_memory, hf_throughput = timing_cuda(
+        model=model,
+        processor=processor,
+        num_runs=args.num_runs,
+        input_text=dataset,
+        voice_preset=args.voice_preset,
+        device = model.device,
+        temperature = args.temperature,
+        max_new_tokens=max_new_tokens,
+        batch_size=batch_size,
+        **additionnal_kwargs,
+    ) 
 
-        print("now compile")
-        #model = torch.compile(model, mode=args.compile_mode, fullgraph=True, dynamic=True)
-        model.semantic = torch.compile(model.semantic, fullgraph=True, dynamic=True, mode = args.compile_mode)
-        model.coarse_acoustics = torch.compile(model.coarse_acoustics, fullgraph=True, dynamic=True, mode = args.compile_mode)
-        model.fine_acoustics = torch.compile(model.fine_acoustics, fullgraph=True, dynamic=True, mode = args.compile_mode)
 
-        # warmup
-        _ = timing_cuda(
-            model=model,
-            processor=processor,
-            num_runs=2,
-            input_text=dataset[:min(2, args.num_samples)],
-            voice_preset=args.voice_preset,
-            device = model.device,
-        )
-
-        # real time
-        sdpa_compile_time, compile_max_memory = timing_cuda(
-            model=model,
-            processor=processor,
-            num_runs=args.num_runs,
-            input_text=dataset,
-            voice_preset=args.voice_preset,
-            device = model.device,
-            temperature = args.temperature,
-        ) 
-
-    full_header = "pt_version,model_name,compile_mode,batch_size,max_num_tokens,optimization,num_samples,num_runs,precision,hf_time,hf_max_memory,sdpa_compile_time,compile_max_memory,temperature\n"
+    full_header = "pt_version,model_name,compile_mode,batch_size,max_num_tokens,optimization,num_samples,num_runs,precision,latency,max_memory,throughput,temperature\n"
 
     if os.path.isfile(args.output_file):
         with open(args.output_file, "r") as f:
@@ -282,9 +243,9 @@ if __name__ == "__main__":
             f.write(full_header)
 
     with open(args.output_file, "a") as f:
-        max_tokens = 764#args.max_num_tokens
-        precision = str(model.dtype)
+        max_tokens = max_new_tokens
+        precision = args.precision #str(model.dtype)
 
         f.write(
-                f"{torch.__version__},{args.model_path},{args.compile_mode},{args.batch_size},{max_tokens},{args.optimization_type},{args.num_samples},{args.num_runs},{precision},{round(hf_time, 5)},{hf_max_memory},{round(sdpa_compile_time, 5)},{compile_max_memory},{round(args.temperature,3)}\n"
+                f"{torch.__version__},{args.model_path},{args.compile_mode},{batch_size},{max_tokens},{args.optimization_type},{args.num_samples},{args.num_runs},{precision},{round(hf_time, 5)},{hf_max_memory},{round(hf_throughput, 5)},{round(args.temperature,3)}\n"
         )

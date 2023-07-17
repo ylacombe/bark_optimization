@@ -1403,7 +1403,7 @@ class BarkModel(BarkPreTrainedModel):
         return audio_arr
 
     @torch.no_grad()
-    def generate_speech(
+    def generate(
         self,
         input_ids: Optional[torch.Tensor] = None,
         history_prompt: Optional[Dict[str, torch.Tensor]] = None,
@@ -1436,7 +1436,7 @@ class BarkModel(BarkPreTrainedModel):
 
         >>> inputs = processor("Hello, my dog is cute, I need him in my life", voice_preset=voice_preset)
 
-        >>> audio_array = model.generate_speech(**inputs)
+        >>> audio_array = model.generate(**inputs)
         >>> audio_array = audio_array.cpu().numpy().squeeze()
         ```
         """
@@ -1489,7 +1489,7 @@ class BarkModel(BarkPreTrainedModel):
 
     def can_generate(self) -> bool:
         """
-        Returns True. Despite not having a `self.generate` method, this model can `generate_speech` and thus needs a
+        Returns True. Despite not having a `self.generate` method, this model can `generate` and thus needs a
         BarkGenerationConfig.
         """
         return True
