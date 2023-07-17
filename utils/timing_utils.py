@@ -17,7 +17,7 @@ def timing_cuda_step_by_step(
     voice_preset: str,
     device: torch.device = torch.device("cpu"),
 ) -> Tuple[float, int]:
-    """test generate_speech from BarkModel steps (generate_text_semantic, generate_coarse, generate_fine)
+    """test generate from BarkModel steps (generate_text_semantic, generate_coarse, generate_fine)
     """
     
     inputs = processor(input_texts, voice_preset).to(model.device)
@@ -189,11 +189,17 @@ def timing_cuda(
     input_text: torch.LongTensor,
     voice_preset: str,
     device: torch.device = torch.device("cpu"),
-    assistant_model = None,
     temperature = 0.7,
+    max_new_tokens = 768,
+    batch_size = 1,
+    **kwargs,
 ) -> Tuple[float, int]:
-    """test generate_speech from BarkModel all at once, processing including
+    """test generate from BarkModel all at once, processing including
     """
+    model.generation_config.semantic_config["max_new_tokens"]=max_new_tokens
+    
+    num_iterations = len(input_text) // batch_size
+    
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
@@ -207,54 +213,23 @@ def timing_cuda(
     input_ids = inputs["input_ids"]
     history_prompt = inputs.get("history_prompt", None)
     
-    for i in tqdm(range(len(input_ids))):
+    for i in tqdm(range(num_iterations)):
         for _ in range(num_runs):
-            _ = model.generate_speech(input_ids = input_ids[[i]], history_prompt=history_prompt, temperature=temperature)
+            _ = model.generate(input_ids = input_ids[i*batch_size: (i+1)*batch_size], history_prompt=history_prompt, temperature=temperature,
+                               **kwargs,
+                                      )
 
 
     end_event.record()
     torch.cuda.synchronize()
     max_memory = torch.cuda.max_memory_allocated(device)
-
-    return (start_event.elapsed_time(end_event) * 1.0e-3) / (num_runs * len(input_text)), max_memory
-
-
-def timing_cuda_assistant_model(
-    model: torch.nn.Module,
-    processor: "BarkProcessor",
-    num_runs: int,
-    input_text: torch.LongTensor,
-    voice_preset: str,
-    device: torch.device = torch.device("cpu"),
-    coarse_assistant = None,
-    temperature = 0.7,
-) -> Tuple[float, int]:
-    """test generate_speech from BarkModel all at once, processing including
-    """
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-
-    torch.cuda.reset_peak_memory_stats(device)
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
-
-    start_event.record()
     
-    inputs = processor(input_text, voice_preset).to(device)
-    input_ids = inputs["input_ids"]
-    history_prompt = inputs.get("history_prompt", None)
-    
-    for i in tqdm(range(len(input_ids))):
-        for _ in range(num_runs):
-            _ = model.generate_speech(input_ids = input_ids[[i]], history_prompt=history_prompt, coarse_assistant=coarse_assistant,
-                                      temperature=temperature)
+    elapsed_time = start_event.elapsed_time(end_event) * 1.0e-3
 
+    latency = elapsed_time / (num_runs * num_iterations)
+    throughput = (num_runs * num_iterations * batch_size) / elapsed_time
 
-    end_event.record()
-    torch.cuda.synchronize()
-    max_memory = torch.cuda.max_memory_allocated(device)
-
-    return (start_event.elapsed_time(end_event) * 1.0e-3) / (num_runs * len(input_text)), max_memory
+    return latency, max_memory, throughput
 
 
 def timing_cuda_old(
