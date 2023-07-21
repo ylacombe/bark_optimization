@@ -18,14 +18,13 @@ from transformers import set_seed
 from datasets import load_dataset
 
 
-SEED = 770
+SEED = 771
 
 set_seed(SEED)
 
 
 
-from utils import timing_cuda
-
+from utils import timing_cuda, generate_offload
 
 def get_parser():
     parser = argparse.ArgumentParser()
@@ -60,15 +59,14 @@ def get_parser():
         help="The model path to use (to set bark-small or bark-large).",
     )
     parser.add_argument(
-        "--compile-mode",
-        type=str,
-        default="reduce-overhead",
-        help="The model compilation mode to use. Refer to the official tutorial of torch.compile: https://pytorch.org/tutorials//intermediate/torch_compile_tutorial.html for more details.",
+        "--use_offload",
+        action="store_true",
+        help="Use offload if true.",
     )
     parser.add_argument(
         "--output_file",
         type=str,
-        default="output_v2.csv",
+        default="output_v3.csv",
         help="The output file to write results. If the file does not exist, it will be created. If the file exists, the results will be appended to the file.",
     )
     parser.add_argument(
@@ -108,13 +106,6 @@ def get_parser():
         type=int,
         default=768,
         help="`max_new_tokens` to generate. This argument is equivalent to the `max_new_tokens` argument in `model.generate`.",
-    )
-    
-    
-    parser.add_argument(
-        "--do_compile",
-        action="store_true",
-        help="Run compile benchmark. Compilation is not working really well atm",
     )
     
     return parser
@@ -201,6 +192,7 @@ if __name__ == "__main__":
 
         model = BetterTransformer.transform(model, keep_original_model=False)
 
+    handmade_generate = generate_offload if args.use_offload else None
 
     # warmup
     _ = timing_cuda(
@@ -209,12 +201,18 @@ if __name__ == "__main__":
         num_runs=2,
         input_text=dataset[:min(2*batch_size, (args.num_samples*batch_size))],
         voice_preset=args.voice_preset,
-        device = model.device,
+        device = torch.device('cuda:0') if args.use_offload else model.device,
         max_new_tokens=max_new_tokens,
         batch_size=batch_size,
+        handmade_generate=handmade_generate,
         **additionnal_kwargs,
     )
-    
+        
+    #if args.precision not in ["torch.int4", "torch.int8"]:
+    #    if args.use_cpu:
+    #        model = model.to("cpu")
+    #    else:
+    #        model = model.to("cuda")
 
     # real timing
     hf_time, hf_max_memory, hf_throughput = timing_cuda(
@@ -223,15 +221,16 @@ if __name__ == "__main__":
         num_runs=args.num_runs,
         input_text=dataset,
         voice_preset=args.voice_preset,
-        device = model.device,
+        device = torch.device('cuda:0') if args.use_offload else model.device,
         temperature = args.temperature,
         max_new_tokens=max_new_tokens,
         batch_size=batch_size,
+        handmade_generate=handmade_generate,
         **additionnal_kwargs,
     ) 
 
 
-    full_header = "pt_version,model_name,compile_mode,batch_size,max_num_tokens,optimization,num_samples,num_runs,precision,latency,max_memory,throughput,temperature\n"
+    full_header = "pt_version,model_name,use_offload,batch_size,max_num_tokens,optimization,num_samples,num_runs,precision,latency,max_memory,throughput,temperature\n"
 
     if os.path.isfile(args.output_file):
         with open(args.output_file, "r") as f:
@@ -246,6 +245,8 @@ if __name__ == "__main__":
         max_tokens = max_new_tokens
         precision = args.precision #str(model.dtype)
 
+        offload_string = "with_offload" if args.use_offload else "no_offload"
+        
         f.write(
-                f"{torch.__version__},{args.model_path},{args.compile_mode},{batch_size},{max_tokens},{args.optimization_type},{args.num_samples},{args.num_runs},{precision},{round(hf_time, 5)},{hf_max_memory},{round(hf_throughput, 5)},{round(args.temperature,3)}\n"
+                f"{torch.__version__},{args.model_path},{offload_string},{batch_size},{max_tokens},{args.optimization_type},{args.num_samples},{args.num_runs},{precision},{round(hf_time, 5)},{hf_max_memory},{round(hf_throughput, 5)},{round(args.temperature,3)}\n"
         )

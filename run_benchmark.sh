@@ -9,9 +9,9 @@ export TRANSFORMERS_CACHE="/home/yoach/.cache/transformers"
 # "generated_assistant"
 # "torch.bfloat16"
 models=("ylacombe/bark-small" "ylacombe/bark-large")
-optimization_types=("bettertransformer") #("generated_assistant") # "flash_attention" "no_optimization" 
+optimization_types=("flash_attention" "no_optimization" "bettertransformer") #("generated_assistant") #  
 #precisions=("torch.float32" "torch.float16" )
-precisions=("torch.int4") # "torch.float16" "torch.float32"
+precisions=("torch.float16" "torch.float32" "torch.int4") # 
 batch_sizes=(1)
 
 # Loop through each combination and execute the python command
@@ -23,7 +23,8 @@ do
     do
       for batch_size in "${batch_sizes[@]}"
       do
-        CUDA_VISIBLE_DEVICES=2 /home/yoach/bark_optimization/bark_optimization_env/bin/python /home/yoach/bark_optimization/main.py --max_num_tokens 256 --num_runs 1 --num_samples 50 --batch_size "$batch_size" --model_path "$model_name" --optimization_type "$optimization_type" --precision "$precision" --output_file "output_bettertransformer.csv"
+        CUDA_VISIBLE_DEVICES=2 /home/yoach/bark_optimization/bark_optimization_env/bin/python /home/yoach/bark_optimization/main.py --use_offload --max_num_tokens 256 --num_runs 2 --num_samples 50 --batch_size "$batch_size" --model_path "$model_name" --optimization_type "$optimization_type" --precision "$precision" --output_file "output_final_1.csv"
+        CUDA_VISIBLE_DEVICES=2 /home/yoach/bark_optimization/bark_optimization_env/bin/python /home/yoach/bark_optimization/main.py --max_num_tokens 256 --num_runs 2 --num_samples 50 --batch_size "$batch_size" --model_path "$model_name" --optimization_type "$optimization_type" --precision "$precision" --output_file "output_final_1.csv"
       done
     done
   done

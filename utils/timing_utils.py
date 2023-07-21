@@ -192,6 +192,7 @@ def timing_cuda(
     temperature = 0.7,
     max_new_tokens = 768,
     batch_size = 1,
+    handmade_generate = None,
     **kwargs,
 ) -> Tuple[float, int]:
     """test generate from BarkModel all at once, processing including
@@ -213,12 +214,20 @@ def timing_cuda(
     input_ids = inputs["input_ids"]
     history_prompt = inputs.get("history_prompt", None)
     
-    for i in tqdm(range(num_iterations)):
-        for _ in range(num_runs):
-            _ = model.generate(input_ids = input_ids[i*batch_size: (i+1)*batch_size], history_prompt=history_prompt, temperature=temperature,
-                               **kwargs,
-                                      )
-
+    
+    if handmade_generate is None:
+        for i in tqdm(range(num_iterations)):
+            for _ in range(num_runs):
+                _ = model.generate(input_ids = input_ids[i*batch_size: (i+1)*batch_size], history_prompt=history_prompt, temperature=temperature,
+                                **kwargs,
+                                        )
+    else:
+        for i in tqdm(range(num_iterations)):
+            for _ in range(num_runs):
+                _ = handmade_generate(model, input_ids = input_ids[i*batch_size: (i+1)*batch_size], history_prompt=history_prompt, temperature=temperature,
+                                **kwargs,
+                                        )
+        
 
     end_event.record()
     torch.cuda.synchronize()
