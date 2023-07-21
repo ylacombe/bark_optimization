@@ -165,7 +165,7 @@ if __name__ == "__main__":
                 low_cpu_mem_usage= (args.precision=="torch.float16"),
                 )  
         
-        if args.use_cpu:
+        if args.use_cpu or args.use_offload:
             model = model.to("cpu")
         else:
             model = model.to("cuda")
