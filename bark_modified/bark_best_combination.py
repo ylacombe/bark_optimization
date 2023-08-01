@@ -1,4 +1,3 @@
-
 # coding=utf-8
 # Copyright 2023 The Suno AI Authors and The HuggingFace Inc. team. All rights reserved.
 #
@@ -21,7 +20,6 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
-
 
 from transformers.generation.logits_process import AlternatingCodebooksLogitsProcessor, SuppressTokensLogitsProcessor
 from transformers.modeling_outputs import CausalLMOutputWithPast, MaskedLMOutput
@@ -55,7 +53,6 @@ BARK_PRETRAINED_MODEL_ARCHIVE_LIST = [
 ]
 
 
-
 class BarkSelfAttention(nn.Module):
     # adapted from GPTNeoSelfAttention and Bark code
     # BarkSelfAttention can have two attention type, i.e full attention or causal attention
@@ -84,26 +81,19 @@ class BarkSelfAttention(nn.Module):
         self.out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=config.bias)
 
         self.is_causal = is_causal
-        
-        if not hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
-            raise ValueError("This BarkModel implementation expect flash attention, i.e a Torch version supporting torch.nn.functional.scaled_dot_product_attention")
-        
-        #if is_causal:
-        #    block_size = config.block_size
-        #    bias = torch.tril(torch.ones((block_size, block_size), dtype=bool)).view(1, 1, block_size, block_size)
-        #    
-        #    # TODO: probably need to comment it ??
-        #    self.register_buffer("bias", bias)
+        if is_causal:
+            block_size = config.block_size
+            bias = torch.tril(torch.ones((block_size, block_size), dtype=bool)).view(1, 1, block_size, block_size)
+            self.register_buffer("bias", bias)
 
+    # Copied from transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoSelfAttention._split_heads
     def _split_heads(self, tensor, num_heads, attn_head_size):
         """
         Splits hidden_size dim into attn_head_size and num_heads
         """
-        # (batch, seq_len, num_heads*attn_head_size) -> (batch, num_heads, seq_len, attn_head_size)
-        tensor = tensor.view(tensor.size()[:-1] + (num_heads, attn_head_size))
-        tensor = tensor.transpose(1, 2)
-
-        return tensor  # (batch, num_heads, seq_len, attn_head_size)
+        new_shape = tensor.size()[:-1] + (num_heads, attn_head_size)
+        tensor = tensor.view(new_shape)
+        return tensor.permute(0, 2, 1, 3)  # (batch, head, seq_length, head_features)
 
     def _merge_heads(self, tensor, num_heads, attn_head_size):
         """
@@ -116,6 +106,37 @@ class BarkSelfAttention(nn.Module):
         tensor = tensor.view(tensor.size()[:-2] + (num_heads * attn_head_size,))
 
         return tensor
+
+    def _attn(self, query, key, value, attention_mask=None, head_mask=None):
+        # unlike GPTNeo's SelfAttention, divide by the square root of the dimension of the query and the key
+        attn_weights = torch.matmul(query, key.transpose(-1, -2)) * (1.0 / math.sqrt(self.head_dim))
+
+        if self.is_causal:
+            query_length, key_length = query.size(-2), key.size(-2)
+
+            # fill the upper left part of the attention weights with inf
+            attn_weights = attn_weights.masked_fill(
+                self.bias[:, :, key_length - query_length : key_length, :key_length] == 0,
+                torch.finfo(attn_weights.dtype).min,
+            )
+
+        if attention_mask is not None:
+            # Apply the attention mask
+            attn_weights = attn_weights + attention_mask
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+        attn_weights = attn_weights.to(value.dtype)
+        attn_weights = self.attn_dropout(attn_weights)
+
+        # Mask heads if we want to
+        if head_mask is not None:
+            attn_weights = attn_weights * head_mask
+
+        # (batch, num_heads, seq_len, seq_len) x (batch, num_heads, seq_len, attn_head_size)
+        # -> (batch, num_heads, seq_len, attn_head_size)
+        attn_output = torch.matmul(attn_weights, value)
+
+        return attn_output, attn_weights
 
     def forward(
         self,
@@ -143,24 +164,8 @@ class BarkSelfAttention(nn.Module):
             present = (key, value)
         else:
             present = None
-            
-        if self.is_causal:
-            if past_key_values is not None:
-                # When `past_key_values` is provided, we're doing incremental decoding and `q.shape[2] == 1`: q only contains
-                # the query for the last token. scaled_dot_product_attention interprets this as the first token in the
-                # sequence, so if is_causal=True it will mask out all attention from it. This is not what we want, so 
-                # to work around this we set is_causal=False.
-                is_causal = False
-            else:
-                is_causal = True
-        else:
-            is_causal = False
 
-        # TODO: careful, attention_mask and is_causal can't be set at the same time
-        attn_output = torch.nn.functional.scaled_dot_product_attention(query, key, value, attn_mask = None, dropout_p=self.dropout, is_causal=is_causal)
-        
-        # TODO: careful, flash attention doesn't return attn_weights AND doesn't support head_mask !
-        attn_weights = None
+        attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
 
         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
         attn_output = self.out_proj(attn_output)
@@ -171,7 +176,6 @@ class BarkSelfAttention(nn.Module):
             outputs += (attn_weights,)
 
         return outputs
-
 
 
 class BarkLayerNorm(nn.Module):
@@ -1486,8 +1490,8 @@ class BarkModel(BarkPreTrainedModel):
         if offload_to_cpu:
    
             self.coarse_output = self.coarse_acoustics.to("cpu")
-            self.fine_acoustics = self.fine_acoustics.to("cuda")
 
+        # no offload of fine_acoustics because it's int4
         # 3. "generate" from the fine model
         output = self.fine_acoustics.generate(
             coarse_output,
@@ -1501,7 +1505,6 @@ class BarkModel(BarkPreTrainedModel):
         
         if offload_to_cpu:
 
-            self.fine_acoustics = self.fine_acoustics.to("cpu")
             self.codec_model = self.codec_model.to("cuda")
 
         # 4. Decode the output and generate audio array
@@ -1519,4 +1522,3 @@ class BarkModel(BarkPreTrainedModel):
         BarkGenerationConfig.
         """
         return True
-

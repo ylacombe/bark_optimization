@@ -8,7 +8,7 @@ from transformers import (
     BarkProcessor,
 )
 
-from bark_modified import FlashAttentionBarkModel
+from bark_modified import FlashAttentionBarkModel, TestBarkModel
 
 from bark.api import generate_audio
 from bark.generation import preload_models, SAMPLE_RATE
@@ -91,7 +91,7 @@ def get_parser():
         "--optimization_type",
         type=str,
         default='no_optimization',
-        help="Optimization type to benchmark. For now, must be in ['flash_attention', 'no_optimization', 'generated_assistant', 'bettertransformer']."
+        help="Optimization type to benchmark. For now, must be in ['flash_attention', 'no_optimization', 'generated_assistant', 'bettertransformer', 'mixed_precision']."
     )
     
     parser.add_argument(
@@ -136,12 +136,38 @@ if __name__ == "__main__":
         model_class = FlashAttentionBarkModel
         
     
-        
+    if optimization_type == "mixed_precision":
 
-    if args.precision in ["torch.int4", "torch.int8"]:
         from transformers import BitsAndBytesConfig
         quantization_config = {
-            "llm_int8_skip_modules":["encodec"],
+            "llm_int8_skip_modules":["semantic", "coarse_acoustics" ,"codec_model"],
+        }
+
+        quantization_config["load_in_4bit"] = True
+
+        quantization_config = BitsAndBytesConfig(**quantization_config)
+
+
+        model = TestBarkModel.from_pretrained(args.model_path,
+                                        torch_dtype=eval("torch.float16"),
+                                        quantization_config=quantization_config)
+
+
+        model.semantic = model.semantic.to("cpu")
+        model.coarse_acoustics = model.coarse_acoustics.to("cpu")
+        model.codec_model = model.codec_model.to("cpu")
+
+
+        from optimum.bettertransformer import BetterTransformer
+
+
+        model = BetterTransformer.transform(model, keep_original_model=False)
+        
+
+    elif args.precision in ["torch.int4", "torch.int8"]:
+        from transformers import BitsAndBytesConfig
+        quantization_config = {
+            "llm_int8_skip_modules":[]#["encodec"],
         }
         
         if args.precision == "torch.int4":
@@ -165,7 +191,7 @@ if __name__ == "__main__":
                 low_cpu_mem_usage= (args.precision=="torch.float16"),
                 )  
         
-        if args.use_cpu or args.use_offload:
+        if args.use_cpu:
             model = model.to("cpu")
         else:
             model = model.to("cuda")
@@ -191,8 +217,9 @@ if __name__ == "__main__":
 
 
         model = BetterTransformer.transform(model, keep_original_model=False)
-
-    handmade_generate = generate_offload if args.use_offload else None
+        
+    if args.use_offload:
+        model.enable_cpu_offload()
 
     # warmup
     _ = timing_cuda(
@@ -201,10 +228,9 @@ if __name__ == "__main__":
         num_runs=2,
         input_text=dataset[:min(2*batch_size, (args.num_samples*batch_size))],
         voice_preset=args.voice_preset,
-        device = torch.device('cuda:0') if args.use_offload else model.device,
+        device = torch.device('cuda') if args.use_offload else model.device,
         max_new_tokens=max_new_tokens,
         batch_size=batch_size,
-        handmade_generate=handmade_generate,
         **additionnal_kwargs,
     )
         
@@ -221,11 +247,10 @@ if __name__ == "__main__":
         num_runs=args.num_runs,
         input_text=dataset,
         voice_preset=args.voice_preset,
-        device = torch.device('cuda:0') if args.use_offload else model.device,
+        device = torch.device('cuda') if args.use_offload else model.device,
         temperature = args.temperature,
         max_new_tokens=max_new_tokens,
         batch_size=batch_size,
-        handmade_generate=handmade_generate,
         **additionnal_kwargs,
     ) 
 
