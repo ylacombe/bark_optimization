@@ -39,6 +39,8 @@ from transformers.models.bark.generation_configuration_bark import (
     BarkSemanticGenerationConfig,
 )
 
+from flash_attn import flash_attn_varlen_qkvpacked_func, flash_attn_varlen_func
+
 
 logger = logging.get_logger(__name__)
 
@@ -81,19 +83,26 @@ class BarkSelfAttention(nn.Module):
         self.out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=config.bias)
 
         self.is_causal = is_causal
-        if is_causal:
-            block_size = config.block_size
-            bias = torch.tril(torch.ones((block_size, block_size), dtype=bool)).view(1, 1, block_size, block_size)
-            self.register_buffer("bias", bias)
+        
+        if not hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
+            raise ValueError("This BarkModel implementation expect flash attention, i.e a Torch version supporting torch.nn.functional.scaled_dot_product_attention")
+        
+        #if is_causal:
+        #    block_size = config.block_size
+        #    bias = torch.tril(torch.ones((block_size, block_size), dtype=bool)).view(1, 1, block_size, block_size)
+        #    
+        #    # TODO: probably need to comment it ??
+        #    self.register_buffer("bias", bias)
 
-    # Copied from transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoSelfAttention._split_heads
     def _split_heads(self, tensor, num_heads, attn_head_size):
         """
         Splits hidden_size dim into attn_head_size and num_heads
         """
-        new_shape = tensor.size()[:-1] + (num_heads, attn_head_size)
-        tensor = tensor.view(new_shape)
-        return tensor.permute(0, 2, 1, 3)  # (batch, head, seq_length, head_features)
+        # (batch, seq_len, num_heads*attn_head_size) -> (batch, num_heads, seq_len, attn_head_size)
+        tensor = tensor.view(tensor.size()[:-1] + (num_heads, attn_head_size))
+        tensor = tensor.transpose(1, 2)
+
+        return tensor  # (batch, num_heads, seq_len, attn_head_size)
 
     def _merge_heads(self, tensor, num_heads, attn_head_size):
         """
@@ -106,37 +115,6 @@ class BarkSelfAttention(nn.Module):
         tensor = tensor.view(tensor.size()[:-2] + (num_heads * attn_head_size,))
 
         return tensor
-
-    def _attn(self, query, key, value, attention_mask=None, head_mask=None):
-        # unlike GPTNeo's SelfAttention, divide by the square root of the dimension of the query and the key
-        attn_weights = torch.matmul(query, key.transpose(-1, -2)) * (1.0 / math.sqrt(self.head_dim))
-
-        if self.is_causal:
-            query_length, key_length = query.size(-2), key.size(-2)
-
-            # fill the upper left part of the attention weights with inf
-            attn_weights = attn_weights.masked_fill(
-                self.bias[:, :, key_length - query_length : key_length, :key_length] == 0,
-                torch.finfo(attn_weights.dtype).min,
-            )
-
-        if attention_mask is not None:
-            # Apply the attention mask
-            attn_weights = attn_weights + attention_mask
-
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
-        attn_weights = attn_weights.to(value.dtype)
-        attn_weights = self.attn_dropout(attn_weights)
-
-        # Mask heads if we want to
-        if head_mask is not None:
-            attn_weights = attn_weights * head_mask
-
-        # (batch, num_heads, seq_len, seq_len) x (batch, num_heads, seq_len, attn_head_size)
-        # -> (batch, num_heads, seq_len, attn_head_size)
-        attn_output = torch.matmul(attn_weights, value)
-
-        return attn_output, attn_weights
 
     def forward(
         self,
@@ -164,8 +142,44 @@ class BarkSelfAttention(nn.Module):
             present = (key, value)
         else:
             present = None
+            
+        if self.is_causal:
+            if past_key_values is not None:
+                # When `past_key_values` is provided, we're doing incremental decoding and `q.shape[2] == 1`: q only contains
+                # the query for the last token. scaled_dot_product_attention interprets this as the first token in the
+                # sequence, so if is_causal=True it will mask out all attention from it. This is not what we want, so 
+                # to work around this we set is_causal=False.
+                is_causal = False
+            else:
+                is_causal = True
+        else:
+            is_causal = False
+            
+        
+        # (batch, num_heads, seq_len, attn_head_size) -> (batch*seq_len, num_heads, attn_head_size)
+        seq_len_q = query.shape[2]
+        seq_len_k = key.shape[2]
+        batch = query.shape[0]
+        
+        query = query.transpose(1,2).view(-1, self.num_heads, self.head_dim)
+        key = key.transpose(1,2).view(-1, self.num_heads, self.head_dim)
+        value = value.transpose(1,2).view(-1, self.num_heads, self.head_dim)
 
-        attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
+        # TODO: dtype ??
+        cu_seqlens_q = torch.arange(0, seq_len_q * (batch + 1), step=seq_len_q, device=value.device, dtype=torch.int32)
+        cu_seqlens_k = torch.arange(0, seq_len_k * (batch + 1), step=seq_len_k, device=value.device, dtype=torch.int32)
+
+        # TODO: careful, attention_mask and is_causal can't be set at the same time
+        attn_output = flash_attn_varlen_func(query, key, value, cu_seqlens_q, cu_seqlens_k, seq_len_q, seq_len_k,
+                                             dropout_p=self.dropout, causal=is_causal)
+        
+        
+        # (total, nheads, headdim) -> (batch, num_heads, seq_len, attn_head_size)
+        attn_output = attn_output.view(batch, -1, self.num_heads, self.head_dim)
+        
+        
+        # TODO: careful, flash attention doesn't return attn_weights AND doesn't support head_mask !
+        attn_weights = None
 
         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
         attn_output = self.out_proj(attn_output)
