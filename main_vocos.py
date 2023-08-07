@@ -14,10 +14,11 @@ from bark.api import generate_audio
 from bark.generation import preload_models, SAMPLE_RATE
 
 import torch
-from transformers import set_seed
 from datasets import load_dataset
 
-from audiocraft.models.encodec import EncodecModel
+from transformers import set_seed
+
+from vocos import Vocos 
 
 SEED = 771
 
@@ -65,6 +66,11 @@ def get_parser():
         help="Use offload if true.",
     )
     parser.add_argument(
+        "--use_mix_models",
+        action="store_true",
+        help="Use bark-large weights for everything but the coarse model which will be loaded in small if true.",
+    )
+    parser.add_argument(
         "--output_file",
         type=str,
         default="output_v3.csv",
@@ -92,7 +98,7 @@ def get_parser():
         "--optimization_type",
         type=str,
         default='no_optimization',
-        help="Optimization type to benchmark. For now, must be in ['flash_attention', 'no_optimization', 'generated_assistant', 'bettertransformer', 'mixed_precision', 'vocos', 'vocos_coarse', 'vocos_coarse_streaming']."
+        help="Optimization type to benchmark. For now, must be in ['no_optimization', 'vocos', 'vocos_coarse', 'vocos_coarse_streaming', 'encodec_v2']."
     )
     
     parser.add_argument(
@@ -130,9 +136,25 @@ if __name__ == "__main__":
     
     additionnal_kwargs = {}
     
-    if optimization_type in ["no_optimization", "generated_assistant", "bettertransformer"]:
+    if optimization_type in ["no_optimization"]:
         model_class = BarkModel
+    elif optimization_type == "encodec_v2":
+        class NewModel(BarkModel):
+            def codec_decode(self, fine_output):
+                """Turn quantized audio codes into audio array using encodec."""
 
+                fine_output = fine_output.transpose(0, 1)
+                emb = self.mbd.codec_model.model.quantizer.decode(fine_output)
+                out = self.mbd.codec_model.model.decoder(emb)
+                
+                
+                wav_diffusion = self.mbd.generate(emb=emb, size=out.size())
+                
+                wav_diffusion = wav_diffusion.squeeze(1)  # squeeze the codebook dimension
+
+                return wav_diffusion
+    
+        model_class = NewModel 
     elif optimization_type == "flash_attention":
         model_class = FlashAttentionBarkModel
         
@@ -193,17 +215,50 @@ if __name__ == "__main__":
 
         
     else:
-        model = model_class.from_pretrained(
-                args.model_path,
-                torch_dtype=eval(args.precision),
-                low_cpu_mem_usage= (args.precision=="torch.float16"),
-                )  
         
+        if args.use_mix_models:
+            model = model_class.from_pretrained(
+                    "suno/bark",
+                    torch_dtype=eval(args.precision),
+                    low_cpu_mem_usage= (args.precision=="torch.float16"),
+                    )  
+            
+            model_small = model_class.from_pretrained(
+                    "suno/bark-small",
+                    torch_dtype=eval(args.precision),
+                    low_cpu_mem_usage= (args.precision=="torch.float16"),
+                    ).coarse_acoustics
+            
+            print(model.coarse_acoustics)
+            model.coarse_acoustics = model_small
+            print(model.coarse_acoustics)
+            
+        else:
+            model = model_class.from_pretrained(
+                    args.model_path,
+                    torch_dtype=eval(args.precision),
+                    low_cpu_mem_usage= (args.precision=="torch.float16"),
+                    )  
+        
+        if optimization_type == "encodec_v2":
+            from audiocraft.models import MultiBandDiffusion
+            bandwidth = 3.0  # 1.5, 3.0, 6.0
+            del model.codec_model
+            model.mbd = MultiBandDiffusion.get_mbd_24khz(bw=bandwidth)
+
+
         if args.use_cpu:
             model = model.to("cpu")
         else:
+            if "vocos" in  optimization_type:
+                # hack to make vocos fp32
+                model.vocos = Vocos.from_pretrained("charactr/vocos-encodec-24khz").to(model.device)
             model = model.to("cuda")
+            if "vocos" in  optimization_type:
+                # hack to make vocos fp32
+                model.vocos = Vocos.from_pretrained("charactr/vocos-encodec-24khz").to(model.device)
 
+        
     # processor
     processor = BarkProcessor.from_pretrained(args.model_path)
     
@@ -219,12 +274,12 @@ if __name__ == "__main__":
         additionnal_kwargs["coarse_assistant_model"] = model_small.coarse_acoustics.to(model.device)
         
         
-    if optimization_type == "bettertransformer":
         
-        from optimum.bettertransformer import BetterTransformer
+    # TODO: attention no_optim = with bettertransform
+    from optimum.bettertransformer import BetterTransformer
 
 
-        model = BetterTransformer.transform(model, keep_original_model=False)
+    model = BetterTransformer.transform(model, keep_original_model=False)
         
     if args.use_offload:
         model.enable_cpu_offload()
@@ -280,6 +335,8 @@ if __name__ == "__main__":
 
         offload_string = "with_offload" if args.use_offload else "no_offload"
         
+        model_path = args.model_path if not args.use_mix_models else "mixed_models"
+        
         f.write(
-                f"{torch.__version__},{args.model_path},{offload_string},{batch_size},{max_tokens},{args.optimization_type},{args.num_samples},{args.num_runs},{precision},{round(hf_time, 5)},{hf_max_memory},{round(hf_throughput, 5)},{round(args.temperature,3)}\n"
+                f"{torch.__version__},{model_path},{offload_string},{batch_size},{max_tokens},{args.optimization_type},{args.num_samples},{args.num_runs},{precision},{round(hf_time, 5)},{hf_max_memory},{round(hf_throughput, 5)},{round(args.temperature,3)}\n"
         )

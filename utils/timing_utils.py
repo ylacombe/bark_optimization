@@ -9,6 +9,11 @@ from transformers.models.bark.generation_configuration_bark import (
     BarkSemanticGenerationConfig,
 )
 
+from transformers import set_seed
+
+SEED = 771
+
+
 def timing_cuda_step_by_step(
     model: torch.nn.Module,
     processor: "BarkProcessor",
@@ -218,12 +223,15 @@ def timing_cuda(
     if handmade_generate is None:
         for i in tqdm(range(num_iterations)):
             for _ in range(num_runs):
-                _ = model.generate(input_ids = input_ids[i*batch_size: (i+1)*batch_size], history_prompt=history_prompt, temperature=temperature,
+                set_seed(SEED)
+                _ = model.generate(input_ids = input_ids[i*batch_size: (i+1)*batch_size], history_prompt=history_prompt,
+                                   attention_mask = inputs["attention_mask"][i*batch_size: (i+1)*batch_size], temperature=temperature,
                                 **kwargs,
                                         )
     else:
         for i in tqdm(range(num_iterations)):
             for _ in range(num_runs):
+                set_seed(SEED)
                 _ = handmade_generate(model, input_ids = input_ids[i*batch_size: (i+1)*batch_size], history_prompt=history_prompt, temperature=temperature,
                                 **kwargs,
                                         )
