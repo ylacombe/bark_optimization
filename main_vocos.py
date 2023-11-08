@@ -48,12 +48,6 @@ def get_parser():
         default=1,
         help="Input batch size.",
     )
-#    parser.add_argument(
-#        "--max-num-tokens",
-#        type=int,
-#        default=256,
-#        help="`max_new_tokens` to generate. This argument is equivalent to the `max_new_tokens` argument in `model.generate`.",
-#    ) # TODO: for now, I won't set this because we already have a limit in generation_config (764 in the first stage)
     parser.add_argument(
         "--model_path",
         type=str,
@@ -73,7 +67,7 @@ def get_parser():
     parser.add_argument(
         "--output_file",
         type=str,
-        default="output_v3.csv",
+        default="output_voice_preset.csv",
         help="The output file to write results. If the file does not exist, it will be created. If the file exists, the results will be appended to the file.",
     )
     parser.add_argument(
@@ -318,7 +312,7 @@ if __name__ == "__main__":
     ) 
 
 
-    full_header = "pt_version,model_name,use_offload,batch_size,max_num_tokens,optimization,num_samples,num_runs,precision,latency,max_memory,throughput,temperature\n"
+    full_header = "pt_version,voice_preset,model_name,use_offload,batch_size,max_num_tokens,optimization,num_samples,num_runs,precision,latency,max_memory,throughput,temperature\n"
 
     if os.path.isfile(args.output_file):
         with open(args.output_file, "r") as f:
@@ -338,5 +332,5 @@ if __name__ == "__main__":
         model_path = args.model_path if not args.use_mix_models else "mixed_models"
         
         f.write(
-                f"{torch.__version__},{model_path},{offload_string},{batch_size},{max_tokens},{args.optimization_type},{args.num_samples},{args.num_runs},{precision},{round(hf_time, 5)},{hf_max_memory},{round(hf_throughput, 5)},{round(args.temperature,3)}\n"
+                f"{torch.__version__},{args.voice_preset},{model_path},{offload_string},{batch_size},{max_tokens},{args.optimization_type},{args.num_samples},{args.num_runs},{precision},{round(hf_time, 5)},{hf_max_memory},{round(hf_throughput, 5)},{round(args.temperature,3)}\n"
         )

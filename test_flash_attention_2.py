@@ -15,7 +15,7 @@ from utils import generate_offload
 api = HfApi()
 set_seed(56379)
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 #os.environ["SUNO_USE_SMALL_MODELS"] = "1"
 
 

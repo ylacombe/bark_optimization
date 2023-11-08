@@ -94,6 +94,11 @@ def get_parser():
         action="store_true",
         help="Use bettertransformer.",
     )
+    parser.add_argument(
+        "--use_harvard",
+        action="store_true",
+        help="Use harvard dataset instead of kensho/spgispeech.",
+    )
     return parser
 
 
@@ -105,10 +110,15 @@ if __name__ == "__main__":
 
     if args.num_samples <= 0:
         raise ValueError("num_samples must be superior to 1")
-    # dataset
-    dataset = load_dataset("kensho/spgispeech", "dev", split="validation", use_auth_token=True)
-    dataset = dataset.shuffle(seed=SEED)["transcript"]
-    dataset = dataset[:(args.num_samples)]
+    
+    if args.use_harvard:
+        dataset = open('./harvard.txt', 'r')
+        dataset = dataset.readlines()
+    else:
+        # dataset
+        dataset = load_dataset("kensho/spgispeech", "dev", split="validation", use_auth_token=True)
+        dataset = dataset.shuffle(seed=SEED)["transcript"]
+        dataset = dataset[:(args.num_samples)]
     
     optimization_type = args.optimization_type
     
@@ -195,12 +205,12 @@ if __name__ == "__main__":
     precision_string = "fp32" if args.precision == "torch.float32" else "fp16"
     
     folder_name = f"{model_path.replace('-','_').replace('/','_')}_{args.optimization_type}_{flash_string}_{precision_string}"
-    folder_path = os.path.join(args.output_folder, folder_name)
+    folder_path = os.path.join(f"{args.output_folder}_{'harvard' if args.use_harvard else 'not_harvard'}", folder_name)
 
     if not os.path.exists(folder_path):
         os.makedirs(folder_path)
         
-    for i in tqdm(range(args.num_samples)):
+    for i in tqdm(range(len(dataset))):
         set_seed(SEED)
         
         inputs = processor(dataset[i], args.voice_preset).to("cuda")
@@ -209,4 +219,4 @@ if __name__ == "__main__":
                                 #semantic_max_new_tokens=max_new_tokens,
             )
         
-        write(os.path.join(folder_path,f"samples_{i}.wav"), model.generation_config.sample_rate, output.detach().cpu().numpy().squeeze().astype(np.float32))
+        write(os.path.join(folder_path, args.voice_preset, f"samples_{i}.wav"), model.generation_config.sample_rate, output.detach().cpu().numpy().squeeze().astype(np.float32))
